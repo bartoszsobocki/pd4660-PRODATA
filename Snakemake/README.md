@@ -1,0 +1,1 @@
+W tym pliku zawarłem najważniejsze pliki z przebiegu analizy Snakemake (cz.1).Ze względu na mnogość plików dodałem tylko te najważniejsze (merged.vcf,przykładowy fastqc trimmed i przed trymowaniem, coverage files dla wszystkich próbek), nie dodawałem kolejnych plików bam dla każdego elemtnu w szlaku procesowym.
