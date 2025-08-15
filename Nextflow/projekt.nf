@@ -1,20 +1,18 @@
 #!/usr/bin/env nextflow
 nextflow.enable.dsl=2
 
-/* ====== PARAMS (Twoje ścieżki) ====== */
+
 params.input               = params.input        ?: '/root/PROJEKT_NEXTFLOW/data/*_{1,2}.fastq.gz'
 params.outdir              = params.outdir       ?: '/root/PROJEKT_NEXTFLOW/results'
 params.fastqc_threads      = (params.fastqc_threads      ?: 2)  as int
 params.trimmomatic_threads = (params.trimmomatic_threads ?: 6)  as int
-params.star_threads        = (params.star_threads        ?: 6)  as int
+params.star_threads        = (params.star_threads        ?: 4)  as int
 params.adapters            = params.adapters     ?: '/root/PROJEKT_NEXTFLOW/TruSeq3-PE.fa'
 params.star_index          = params.star_index   ?: '/root/PROJEKT_NEXTFLOW/STAR_index'
 params.multiqc_title       = params.multiqc_title ?: 'Analiza MultiQC'
 params.ref                 = params.ref          ?: '/root/PROJEKT_NEXTFLOW/reference/NC_045512.2.fasta'
-params.star_sort_ram = (params.star_sort_ram ?: 1200000000) as long
 
 
-/* ====== FASTQC (RAW) ====== */
 process FASTQC {
   tag { meta.id }
   publishDir "${params.outdir}/fastqc", mode: 'copy'
@@ -30,11 +28,12 @@ process FASTQC {
 
   script:
   """
+  set -eo pipefail
   fastqc -t ${task.cpus} -o . ${fastq_file}
   """
 }
 
-/* ====== MULTIQC (z FASTQC) ====== */
+
 process MULTIQC {
   tag "multiqc"
   publishDir "${params.outdir}/multiqc", mode: 'copy'
@@ -49,11 +48,12 @@ process MULTIQC {
 
   script:
   """
+  set -eo pipefail
   multiqc . --title '${params.multiqc_title}'
   """
 }
 
-/* ====== TRIMMOMATIC (niezależnie od FASTQC/MULTIQC) ====== */
+
 process TRIMMOMATIC {
   tag { meta.id }
   publishDir "${params.outdir}/trimmed", mode: 'copy'
@@ -69,7 +69,7 @@ process TRIMMOMATIC {
   script:
   def clip = file(params.adapters).exists() ? "ILLUMINACLIP:${params.adapters}:2:30:10:8:true" : ""
   """
-  set -euo pipefail
+  set -eo pipefail
   trimmomatic PE -threads ${task.cpus} \
     ${r1} ${r2} \
     ${meta.id}_1_paired.fq.gz ${meta.id}_1_unpaired.fq.gz \
@@ -78,12 +78,12 @@ process TRIMMOMATIC {
   """
 }
 
-/* ====== STAR (mapowanie po TRIMMOMATIC) ====== */
+
 process STAR_ALIGN {
   tag { meta.id }
   publishDir "${params.outdir}/aligned", mode: 'copy'
   cpus params.star_threads
-  conda 'bioconda::star=2.7.11b'
+  conda 'bioconda::star=2.7.11b bioconda::samtools=1.17'
 
   input:
   tuple val(meta), path(t1), path(t2)
@@ -93,47 +93,51 @@ process STAR_ALIGN {
 
   script:
   """
-  set -euo pipefail
+  set -eo pipefail
 
-  # sprawdźmy czy index istnieje (genomeParameters.txt)
-  if [[ ! -f "${params.star_index}/genomeParameters.txt" ]]; then
-    echo "FATAL: Brak pliku ${params.star_index}/genomeParameters.txt (czy na pewno zbudowany STAR_index?)." >&2
-    exit 1
-  fi
 
+
+
+  
   STAR --runThreadN ${task.cpus} \
-       --genomeDir ${params.star_index} \
+       --genomeDir "${params.star_index}" \
        --readFilesIn ${t1} ${t2} \
        --readFilesCommand zcat \
        --outFileNamePrefix ${meta.id}_ \
-       --outSAMtype BAM SortedByCoordinate
+       --outSAMtype BAM Unsorted
 
-  mv ${meta.id}_Aligned.sortedByCoord.out.bam ${meta.id}.bam
+
+  samtools sort -@ ${task.cpus} -m 256M \
+    -o ${meta.id}.bam ${meta.id}_Aligned.out.bam
+
+  rm -f ${meta.id}_Aligned.out.bam
   """
 }
 
-/* ====== SAMTOOLS INDEX (indeksowanie BAM) ====== */
+
 process INDEX_BAM {
   tag { meta.id }
   publishDir "${params.outdir}/aligned", mode: 'copy'
-  conda 'bioconda::samtools=1.20'
+  cpus 2
+  conda 'bioconda::samtools=1.17'
 
   input:
-  tuple val(meta), path(bam), path(log)
+  tuple val(meta), path(bam)
 
   output:
   tuple val(meta), path("${meta.id}.bam"), path("${meta.id}.bam.bai")
 
   script:
   """
-  set -euo pipefail
-  samtools index -@ 2 ${bam}
-  ln -sf ${bam} ${meta.id}.bam
-  ln -sf ${bam}.bai ${meta.id}.bam.bai
+  set -eo pipefail
+  if [[ "\$(basename "${bam}")" != "${meta.id}.bam" ]]; then
+    mv "${bam}" "${meta.id}.bam"
+  fi
+  samtools index -@ ${task.cpus} "${meta.id}.bam"
   """
 }
 
-/* ====== POKRYCIE (samtools depth) ====== */
+
 process COVERAGE {
   tag { meta.id }
   publishDir "${params.outdir}/coverage", mode: 'copy'
@@ -147,16 +151,20 @@ process COVERAGE {
 
   script:
   """
-  set -euo pipefail
-  # pełne pokrycie per pozycja
+  set -eo pipefail
   samtools depth -a ${bam} > ${meta.id}.depth.txt
 
-  # prosta statystyka: średnie pokrycie i % pozycji z >=10x
-  awk 'BEGIN{cov=0; n=0; ge10=0} {cov+=\$3; n++; if(\$3>=10) ge10++} END{if(n>0){print "mean_coverage\\t"cov/n; print "bases>=10x(%)\\t"100*ge10/n}else{print "mean_coverage\\t0"; print "bases>=10x(%)\\t0"}}' ${meta.id}.depth.txt > ${meta.id}.coverage_summary.txt
+  awk 'BEGIN{cov=0; n=0; ge10=0} {cov+=\$3; n++; if(\$3>=10) ge10++} END{
+    if(n>0){
+      print "mean_coverage\\t"cov/n;
+      print "bases>=10x(%)\\t"100*ge10/n
+    } else {
+      print "mean_coverage\\t0";
+      print "bases>=10x(%)\\t0"
+    }}' ${meta.id}.depth.txt > ${meta.id}.coverage_summary.txt
   """
 }
 
-/* ====== WARIANTY (bcftools mpileup + call) ====== */
 process VARIANT_CALL {
   tag { meta.id }
   publishDir "${params.outdir}/variants", mode: 'copy'
@@ -170,8 +178,7 @@ process VARIANT_CALL {
 
   script:
   """
-  set -euo pipefail
-
+  set -eo pipefail
   if [[ ! -f "${params.ref}" ]]; then
     echo "FATAL: Brak referencji: ${params.ref}" >&2
     exit 1
@@ -184,13 +191,35 @@ process VARIANT_CALL {
   """
 }
 
-/* ================= WORKFLOW ================ */
-workflow {
 
+process MERGE_VARIANTS {
+  publishDir "${params.outdir}/variants", mode: 'copy'
+  conda 'bioconda::bcftools=1.20'
+
+  input:
+  path vcfs
+  path tbis
+
+  output:
+  path "merged_variants.vcf.gz"
+  path "merged_variants.vcf.gz.tbi"
+
+  script:
+
+  def vcf_list = (vcfs instanceof List ? vcfs : [vcfs]).collect{ it.getName() }.join(' ')
+  """
+  set -eo pipefail
+  bcftools merge -Oz -o merged_variants.vcf.gz ${vcf_list}
+  bcftools index -t merged_variants.vcf.gz
+  """
+}
+
+
+workflow {
   log.info """
   ============================================
    FASTQC → MULTIQC   +   TRIMMOMATIC → STAR
-   + index BAM → coverage → variants
+   + index BAM → coverage → variants → MERGE
   ============================================
   input      : ${params.input}
   outdir     : ${params.outdir}
@@ -199,35 +228,39 @@ workflow {
   ref fasta  : ${params.ref}
   """
 
-  /* Kanał do FASTQC (pojedyncze pliki) */
   raw_files_ch = Channel
     .fromPath(params.input, checkIfExists: true)
     .map { f ->
       def id = f.simpleName
-              .replaceFirst(/_R?1$/, '')
-              .replaceFirst(/_R?2$/, '')
-              .replaceFirst(/\.fastq(?:\.gz)?$/, '')
-      tuple([id: id], f)
+               .replaceFirst(/_R?1$/, '')
+               .replaceFirst(/_R?2$/, '')
+               .replaceFirst(/\.fastq(?:\.gz)?$/, '')
+      tuple([id:id], f)
     }
 
-  /* FASTQC + MULTIQC */
   fastqc_out = FASTQC(raw_files_ch)
   zip_list   = fastqc_out.fastqc_zip.map{ it[1] }.collect()
   MULTIQC(zip_list)
 
-  /* Pary do TRIMMOMATIC/STAR */
+
   pairs_ch = Channel
     .fromFilePairs(params.input, checkIfExists: true)
     .map { sid, files -> tuple([id: "${sid}"], files[0], files[1]) }
 
-  trimmed   = TRIMMOMATIC(pairs_ch)
-  aligned   = STAR_ALIGN(trimmed)
-  indexed   = INDEX_BAM(aligned)
+  trimmed         = TRIMMOMATIC(pairs_ch)
+  aligned         = STAR_ALIGN(trimmed)                           // (meta, bam, log)
+  aligned_for_idx = aligned.map { meta, bam, log -> tuple(meta, bam) } // zrzucamy log
+  indexed         = INDEX_BAM(aligned_for_idx)                    // (meta, bam, bai)
+
   COVERAGE(indexed)
-  VARIANT_CALL(indexed)
+
+  variants  = VARIANT_CALL(indexed)                               // (meta, vcf, tbi)
+  all_vcfs  = variants.map { meta, vcf, tbi -> vcf }.collect()
+  all_tbis  = variants.map { meta, vcf, tbi -> tbi }.collect()
+  MERGE_VARIANTS(all_vcfs, all_tbis)
 }
 
-/* ====== Podsumowanie ====== */
+
 workflow.onComplete {
   println ""
   println "✅ Gotowe"
@@ -236,5 +269,9 @@ workflow.onComplete {
   println "  TRIM      : ${params.outdir}/trimmed"
   println "  STAR BAM  : ${params.outdir}/aligned/*.bam (+ .bai)"
   println "  COVERAGE  : ${params.outdir}/coverage/*.depth.txt, *.coverage_summary.txt"
+  println "  VARIANTS  : ${params.outdir}/variants/*.vcf.gz(.tbi)"
+  println "  MERGED    : ${params.outdir}/variants/merged_variants.vcf.gz(.tbi)"
+}
+
   println "  VARIANTS  : ${params.outdir}/variants/*.vcf.gz(.tbi)"
 }
